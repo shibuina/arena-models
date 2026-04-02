@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -13,6 +14,8 @@ import chromadb.api.models.Collection
 from chromadb.utils import embedding_functions
 
 from ..impl import Annotation
+
+logger = logging.getLogger(__name__)
 
 TextOrEmbedding = typing.Text | typing.List[float]
 
@@ -205,15 +208,19 @@ class Database:
         try:
             from transformers import AutoModel, AutoTokenizer
         except Exception:
+            logger.warning("SigLIP encoder unavailable: 'transformers' package not installed.")
             with _ENCODER_LOCK:
                 _ENCODER_UNAVAILABLE = True
             return None
 
         try:
+            logger.info("Loading SigLIP encoder '%s' (local_only=%s)...", model_name, local_only)
             tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=local_only)
             model = AutoModel.from_pretrained(model_name, local_files_only=local_only)
             model.eval()
-        except Exception:
+            logger.info("SigLIP encoder loaded successfully.")
+        except Exception as error:
+            logger.warning("SigLIP encoder unavailable: failed to load '%s': %s", model_name, error)
             with _ENCODER_LOCK:
                 _ENCODER_UNAVAILABLE = True
             return None
@@ -242,6 +249,7 @@ class Database:
         try:
             import torch
         except Exception:
+            logger.warning("SigLIP encoder unavailable: 'torch' package not installed.")
             with _ENCODER_LOCK:
                 _ENCODER_UNAVAILABLE = True
             return None
@@ -271,13 +279,15 @@ class Database:
                     denom = weights.sum().clamp(min=1e-9)
                     vec = (hidden * weights).sum(dim=0) / denom
             else:
+                logger.warning("SigLIP model output has no usable embedding attribute.")
                 return None
 
             norm = torch.linalg.norm(vec).item()
             if not math.isfinite(norm) or norm <= 0.0:
                 return None
             normalized = (vec / norm).detach().cpu().to(torch.float32).tolist()
-        except Exception:
+        except Exception as error:
+            logger.warning("SigLIP embedding inference failed: %s", error)
             return None
 
         with _ENCODER_LOCK:
