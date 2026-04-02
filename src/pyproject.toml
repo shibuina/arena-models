@@ -21,6 +21,9 @@ dependencies = [
     "cattrs~=25.2.0",
     "typer~=0.19.1",
     "enlighten~=1.14.1",
+    "torch~=2.2.0",
+    "transformers~=4.46.0",
+    "sentencepiece~=0.2.0",
 ]
 # requires-python = "==3.11.*" # only required for arena_models[build]
 
@@ -38,4 +41,3 @@ Repository = "https://github.com/arena-models/arena-models"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["arena_models*"]
-
