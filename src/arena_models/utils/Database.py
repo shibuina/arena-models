@@ -86,7 +86,9 @@ class Database:
         if context_payload is not None:
             object_query = str(context_payload.get("object_description") or "").strip()
             if not object_query:
-                return self.collection(collection).query(query_texts=[""], n_results=n_return)
+                result = self.collection(collection).query(query_texts=[""], n_results=n_return)
+                result["ranking_mode"] = "text"
+                return result
             base = self.collection(collection).query(
                 query_texts=[object_query],
                 n_results=n_retrieve,
@@ -99,22 +101,28 @@ class Database:
             )
 
         if isinstance(embedding, str):
-            return self.collection(collection).query(
+            result = self.collection(collection).query(
                 query_texts=[embedding],
-                n_results=n_retrieve
+                n_results=n_retrieve,
             )
+            result["ranking_mode"] = "text"
+            return result
 
         if isinstance(embedding, dict):
             text = str(embedding.get("object_description") or embedding.get("query") or "").strip()
-            return self.collection(collection).query(
+            result = self.collection(collection).query(
                 query_texts=[text or ""],
                 n_results=n_retrieve,
             )
+            result["ranking_mode"] = "text"
+            return result
 
-        return self.collection(collection).query(
+        result = self.collection(collection).query(
             query_embeddings=[embedding],
-            n_results=n_retrieve
+            n_results=n_retrieve,
         )
+        result["ranking_mode"] = "embedding"
+        return result
 
     def query_context(
         self,
@@ -130,6 +138,16 @@ class Database:
             top_k_retrieve=top_k_retrieve,
             top_k_return=top_k_return,
         )
+
+    def get_embedding(self, text: str) -> list[float] | None:
+        """Return the SigLIP embedding for *text*, or None if unavailable."""
+        return self._normalized_embedding(text)
+
+    def embedding_similarity(self, text_a: str, text_b: str) -> float | None:
+        """Cosine similarity between SigLIP embeddings of two texts (0..1), or None."""
+        a = self._normalized_embedding(text_a)
+        b = self._normalized_embedding(text_b)
+        return self._vector_similarity(a, b)
 
     def _to_embedding(self, value: TextOrEmbedding) -> list[float]:
         if isinstance(value, str):
@@ -452,6 +470,7 @@ class Database:
         if not isinstance(target_bbox, dict):
             target_bbox = None
 
+        used_siglip = False
         rows: list[dict[str, typing.Any]] = []
         for idx, metadata in enumerate(metadata_rows):
             if not isinstance(metadata, dict):
@@ -484,11 +503,22 @@ class Database:
             object_sim = object_embed_sim
             if object_sim is None:
                 object_sim = retrieval_sim if retrieval_sim is not None else object_lexical_sim
+            else:
+                used_siglip = True
 
             context_sim = context_embed_sim if context_embed_sim is not None else context_lexical_sim
+            if context_embed_sim is not None:
+                used_siglip = True
+
             score = (0.55 * object_sim) + (0.30 * context_sim) + (0.15 * bbox_fit)
             row["score"] = score
             rows.append(row)
+
+        ranking_mode = "siglip" if used_siglip else "lexical"
+        logger.info(
+            "Reranking %d candidates for '%s' using %s scoring.",
+            len(rows), object_query, ranking_mode,
+        )
 
         rows.sort(
             key=lambda row: (
@@ -496,4 +526,6 @@ class Database:
                 str((row.get("metadata") or {}).get("name", "")),
             )
         )
-        return self._rebuild_result(result, rows[:top_k_return])
+        rebuilt = self._rebuild_result(result, rows[:top_k_return])
+        rebuilt["ranking_mode"] = ranking_mode
+        return rebuilt
