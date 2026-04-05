@@ -22,8 +22,11 @@ TextOrEmbedding = typing.Text | typing.List[float]
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _ENCODER_LOCK = threading.Lock()
 _ENCODER_CACHE: tuple[typing.Any, typing.Any] | None = None
+_VISION_ENCODER_CACHE: tuple[typing.Any, typing.Any] | None = None
 _ENCODER_UNAVAILABLE = False
+_VISION_ENCODER_UNAVAILABLE = False
 _TEXT_EMBEDDING_CACHE: dict[str, list[float]] = {}
+_IMAGE_EMBEDDING_CACHE: dict[str, list[float]] = {}
 _METADATA_EMBEDDING_CACHE: dict[tuple[str, str], list[float]] = {}
 
 
@@ -194,11 +197,16 @@ class Database:
         else:
             bbox_payload = None
 
+        room_image = payload.get("room_image_b64")
+        if not isinstance(room_image, str) or not room_image.strip():
+            room_image = None
+
         return {
             "object_description": str(payload.get("object_description") or ""),
             "room_prompt": str(payload.get("room_prompt") or ""),
             "neighbouring_assets": [str(item) for item in neighbours if str(item).strip()],
             "target_bbox": bbox_payload,
+            "room_image_b64": room_image,
         }
 
     @staticmethod
@@ -225,6 +233,10 @@ class Database:
 
         try:
             from transformers import AutoModel, AutoTokenizer
+            try:
+                from transformers import SiglipTextModel as _TextModel
+            except ImportError:
+                _TextModel = None
         except Exception:
             logger.warning("SigLIP encoder unavailable: 'transformers' package not installed.")
             with _ENCODER_LOCK:
@@ -234,7 +246,8 @@ class Database:
         try:
             logger.info("Loading SigLIP encoder '%s' (local_only=%s)...", model_name, local_only)
             tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=local_only)
-            model = AutoModel.from_pretrained(model_name, local_files_only=local_only)
+            loader = _TextModel if _TextModel is not None else AutoModel
+            model = loader.from_pretrained(model_name, local_files_only=local_only)
             model.eval()
             logger.info("SigLIP encoder loaded successfully.")
         except Exception as error:
@@ -310,6 +323,104 @@ class Database:
 
         with _ENCODER_LOCK:
             _TEXT_EMBEDDING_CACHE[key] = normalized
+        return normalized
+
+    def _load_vision_encoder(self) -> tuple[typing.Any, typing.Any] | None:
+        global _VISION_ENCODER_CACHE, _VISION_ENCODER_UNAVAILABLE
+        with _ENCODER_LOCK:
+            if _VISION_ENCODER_CACHE is not None:
+                return _VISION_ENCODER_CACHE
+            if _VISION_ENCODER_UNAVAILABLE:
+                return None
+
+        model_name = os.getenv("ARENA_MODELS_SIGLIP_TEXT_MODEL", "google/siglip-base-patch16-224")
+        local_only = os.getenv("ARENA_MODELS_EMBEDDING_LOCAL_ONLY", "0").strip().lower() in ("1", "true", "yes")
+
+        try:
+            from transformers import AutoImageProcessor, AutoModel
+            try:
+                from transformers import SiglipVisionModel as _VisionModel
+            except ImportError:
+                _VisionModel = None
+        except Exception:
+            logger.warning("SigLIP vision encoder unavailable: 'transformers' package not installed.")
+            with _ENCODER_LOCK:
+                _VISION_ENCODER_UNAVAILABLE = True
+            return None
+
+        try:
+            logger.info("Loading SigLIP vision encoder '%s' (local_only=%s)...", model_name, local_only)
+            processor = AutoImageProcessor.from_pretrained(model_name, local_files_only=local_only)
+            loader = _VisionModel if _VisionModel is not None else AutoModel
+            model = loader.from_pretrained(model_name, local_files_only=local_only)
+            model.eval()
+            logger.info("SigLIP vision encoder loaded successfully.")
+        except Exception as error:
+            logger.warning("SigLIP vision encoder unavailable: failed to load '%s': %s", model_name, error)
+            with _ENCODER_LOCK:
+                _VISION_ENCODER_UNAVAILABLE = True
+            return None
+
+        with _ENCODER_LOCK:
+            _VISION_ENCODER_CACHE = (processor, model)
+        return processor, model
+
+    def _normalized_image_embedding(self, image_b64: str) -> list[float] | None:
+        global _VISION_ENCODER_UNAVAILABLE
+        if not image_b64:
+            return None
+
+        cache_key = image_b64[:128]
+        with _ENCODER_LOCK:
+            cached = _IMAGE_EMBEDDING_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        encoder = self._load_vision_encoder()
+        if encoder is None:
+            return None
+        processor, model = encoder
+
+        try:
+            import base64
+            import io
+
+            import torch
+            from PIL import Image
+        except Exception:
+            logger.warning("SigLIP vision encoder unavailable: missing dependencies (torch/PIL).")
+            with _ENCODER_LOCK:
+                _VISION_ENCODER_UNAVAILABLE = True
+            return None
+
+        try:
+            image_data = base64.b64decode(image_b64)
+            image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            inputs = processor(images=image, return_tensors="pt")
+
+            with torch.no_grad():
+                output = model(**inputs)
+
+            if hasattr(output, "image_embeds") and output.image_embeds is not None:
+                vec = output.image_embeds[0]
+            elif hasattr(output, "pooler_output") and output.pooler_output is not None:
+                vec = output.pooler_output[0]
+            elif hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+                vec = output.last_hidden_state[0].mean(dim=0)
+            else:
+                logger.warning("SigLIP vision model output has no usable embedding attribute.")
+                return None
+
+            norm = torch.linalg.norm(vec).item()
+            if not math.isfinite(norm) or norm <= 0.0:
+                return None
+            normalized = (vec / norm).detach().cpu().to(torch.float32).tolist()
+        except Exception as error:
+            logger.warning("SigLIP image embedding inference failed: %s", error)
+            return None
+
+        with _ENCODER_LOCK:
+            _IMAGE_EMBEDDING_CACHE[cache_key] = normalized
         return normalized
 
     @staticmethod
@@ -470,7 +581,11 @@ class Database:
         if not isinstance(target_bbox, dict):
             target_bbox = None
 
+        room_image_b64 = context_payload.get("room_image_b64")
+        room_image_embed = self._normalized_image_embedding(room_image_b64) if room_image_b64 else None
+
         used_siglip = False
+        used_vision = False
         rows: list[dict[str, typing.Any]] = []
         for idx, metadata in enumerate(metadata_rows):
             if not isinstance(metadata, dict):
@@ -496,6 +611,12 @@ class Database:
                 metadata=metadata,
             )
 
+            # Cross-modal: room image embedding vs candidate text embedding
+            image_sim: float | None = None
+            if room_image_embed is not None:
+                candidate_embed = self._metadata_embedding(collection, metadata, candidate_text)
+                image_sim = self._vector_similarity(room_image_embed, candidate_embed)
+
             object_lexical_sim = self._text_overlap(object_query, candidate_text)
             context_lexical_sim = self._text_overlap(context_query, candidate_text, neutral_if_empty=True)
             bbox_fit = self._bbox_fit(target_bbox, metadata)
@@ -510,11 +631,16 @@ class Database:
             if context_embed_sim is not None:
                 used_siglip = True
 
-            score = (0.55 * object_sim) + (0.30 * context_sim) + (0.15 * bbox_fit)
+            if image_sim is not None:
+                used_vision = True
+                # With image: object 0.45, context 0.20, image 0.20, bbox 0.15
+                score = (0.45 * object_sim) + (0.20 * context_sim) + (0.20 * image_sim) + (0.15 * bbox_fit)
+            else:
+                score = (0.55 * object_sim) + (0.30 * context_sim) + (0.15 * bbox_fit)
             row["score"] = score
             rows.append(row)
 
-        ranking_mode = "siglip" if used_siglip else "lexical"
+        ranking_mode = "siglip+vision" if used_vision else ("siglip" if used_siglip else "lexical")
         logger.info(
             "Reranking %d candidates for '%s' using %s scoring.",
             len(rows), object_query, ranking_mode,
